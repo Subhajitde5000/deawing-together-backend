@@ -1,14 +1,25 @@
 import json
+import os
+
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from room_manager import RoomManager
 
+load_dotenv()
+
+ALLOWED_ORIGINS: list[str] = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
 app = FastAPI(title="Drawing Together — WebSocket Server")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Restrict to your frontend domain in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,7 +46,7 @@ def room_info(room_id: str):
     if not manager.room_exists(room_id):
         return {"room_id": room_id, "players": 0, "full": False}
     count = manager.player_count(room_id)
-    return {"room_id": room_id, "players": count, "full": count >= 2}
+    return {"room_id": room_id, "players": count, "full": manager.is_full(room_id)}
 
 
 # ---------------------------------------------------------------------------

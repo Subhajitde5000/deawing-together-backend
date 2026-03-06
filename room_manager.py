@@ -1,24 +1,32 @@
+import os
+
+from dotenv import load_dotenv
 from fastapi import WebSocket
 from typing import Dict, List
+
+load_dotenv()
+
+MAX_PLAYERS: int = int(os.getenv("MAX_PLAYERS_PER_ROOM", "2"))
 
 
 class RoomManager:
     def __init__(self):
         # room_id -> list of connected WebSocket players
         self.rooms: Dict[str, List[WebSocket]] = {}
+        self.max_players: int = MAX_PLAYERS
 
     def room_exists(self, room_id: str) -> bool:
         return room_id in self.rooms
 
     def is_full(self, room_id: str) -> bool:
-        return len(self.rooms.get(room_id, [])) >= 2
+        return len(self.rooms.get(room_id, [])) >= MAX_PLAYERS
 
     def connect(self, room_id: str, websocket: WebSocket) -> bool:
         """
         Add a player to a room.
         Returns True on success, False if room is full.
         """
-        if self.is_full(room_id):
+        if len(self.rooms.get(room_id, [])) >= MAX_PLAYERS:
             return False
 
         if room_id not in self.rooms:
