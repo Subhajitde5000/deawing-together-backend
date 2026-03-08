@@ -33,6 +33,7 @@ manager = RoomManager()
 # ---------------------------------------------------------------------------
 
 @app.get("/")
+@app.head("/")
 def health_check():
     return {"status": "ok", "message": "Drawing Together backend is running"}
 
