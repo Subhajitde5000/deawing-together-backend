@@ -55,13 +55,13 @@ def room_info(room_id: str):
 
 @app.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
-    # Origin check — skip if list contains "*" (allow all)
-    if "*" not in ALLOWED_ORIGINS:
-        origin = websocket.headers.get("origin")
-        if origin and origin not in ALLOWED_ORIGINS:
-            print(f"WebSocket rejected: origin '{origin}' not in {ALLOWED_ORIGINS}")
-            await websocket.close(code=1008)
-            return
+    # optional origin check using the same list used by CORS
+    origin = websocket.headers.get("origin")
+    if origin and ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
+        # log for debugging
+        print(f"WebSocket connection rejected, origin {origin} not in allowed list {ALLOWED_ORIGINS}")
+        await websocket.close(code=1008)
+        return
 
     # Reject if room is full before accepting the connection
     if manager.is_full(room_id):
