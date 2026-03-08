@@ -17,10 +17,15 @@ ALLOWED_ORIGINS: list[str] = [
 
 app = FastAPI(title="Drawing Together — WebSocket Server")
 
+# allow_credentials=True is incompatible with allow_origins=["*"] per the CORS
+# spec — browsers reject the combination. Only enable credentials when a
+# specific origin list is provided.
+_allow_credentials = "*" not in ALLOWED_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
