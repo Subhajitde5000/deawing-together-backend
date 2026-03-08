@@ -200,3 +200,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 json.dumps({"type": "player_left", "players": remaining}),
                 sender=websocket,
             )
+
+
+# ---------------------------------------------------------------------------
+# Server startup (when run directly)
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # The hosting platform (Render, Heroku, etc.) typically sets PORT and maybe HOST
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", os.getenv("UVICORN_PORT", "8000")))
+    # uvicorn may not be imported until runtime to avoid affecting FastAPI imports
+    import uvicorn
+
+    uvicorn.run("main:app", host=host, port=port)
