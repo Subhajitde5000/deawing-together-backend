@@ -1,12 +1,17 @@
 import asyncio
 import json
 import os
+import sys
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from room_manager import RoomManager
+
+# Police-Thieves mode (folder name has a hyphen, so we add it to the path)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "police-thieves"))
+from router import router as pt_router  # noqa: E402
 
 load_dotenv()
 
@@ -17,6 +22,7 @@ ALLOWED_ORIGINS: list[str] = [
 ]
 
 app = FastAPI(title="Drawing Together — WebSocket Server")
+app.include_router(pt_router)
 
 _allow_credentials = "*" not in ALLOWED_ORIGINS
 
