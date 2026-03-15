@@ -4,7 +4,7 @@ Police & Thieves – game logic
   - 1 police vs N thieves on a 20×20 map
   - Hiding phase (30 s) → thieves move freely, police is frozen
   - Active phase (round timer) → police hunts; thieves can move & counter-capture
-  - Capture: proximity < CAPTURE_RADIUS tiles
+  - Capture: proximity < CAPTURE_RADIUS world units (3D distance from raw_x/raw_z)
   - Win: police catches all thieves | a thief catches police | timer expires
 """
 
@@ -19,8 +19,11 @@ from dataclasses import dataclass, field
 
 MAP_W = 20
 MAP_H = 20
-CAPTURE_RADIUS = 1.5        # tiles — police catches thief
-COUNTER_RADIUS = 0.8        # tiles — thief catches police (must sneak up close)
+# Capture radii in raw 3D world units.
+# City: BLOCK_GAP=22 wu/block, character capsule radius ≈ 0.4 wu.
+# A "touch" is roughly 1–2 wu apart.
+CAPTURE_RADIUS   = 3.5   # police catches thief  (generous tag range)
+COUNTER_RADIUS   = 3.5   # thief catches police   (same range; thief wins if in range first)
 HIDE_TIME = 30              # seconds
 DEFAULT_ROUND_TIME = 120    # seconds
 TICK_RATE = 0.05            # 20 ticks/s
@@ -119,24 +122,67 @@ def _is_walkable(x: float, y: float) -> bool:
 
 
 def _distance(a: Player, b: Player) -> float:
-    return sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+    """Distance in raw 3D world units (raw_x / raw_z reported by Three.js)."""
+    return sqrt((a.raw_x - b.raw_x) ** 2 + (a.raw_z - b.raw_z) ** 2)
+
+
+def _thief_is_behind_police(police: "Player", thief: "Player") -> bool:
+    """
+    True if the thief is in the BACK half of the police.
+    Police forward = (sin(rot), cos(rot)).  If dot(forward, police→thief) < 0,
+    the thief is behind the police.
+    """
+    import math
+    fwd_x = math.sin(police.raw_rot)
+    fwd_z = math.cos(police.raw_rot)
+    dx = thief.raw_x - police.raw_x
+    dz = thief.raw_z - police.raw_z
+    return (fwd_x * dx + fwd_z * dz) < 0
 
 
 # ── Room ───────────────────────────────────────────────────────────────────────
 
 class Room:
-    def __init__(self, room_id: str, host_id: str, round_time: int = DEFAULT_ROUND_TIME):
-        self.room_id    = room_id
-        self.host_id    = host_id
-        self.phase      = Phase.LOBBY
-        self.round_time = round_time
-        self.time_left  = round_time
+    def __init__(self, room_id: str, host_id: str, round_time: int = DEFAULT_ROUND_TIME,
+                 hide_time: int = HIDE_TIME, total_rounds: int = 1):
+        self.room_id      = room_id
+        self.host_id      = host_id
+        self.phase        = Phase.LOBBY
+        self.round_time   = round_time
+        self.hide_time    = hide_time
+        self.total_rounds = total_rounds
+        self.current_round = 1
+        self.time_left    = round_time
         self.players:   Dict[str, Player] = {}
         self.police_id: Optional[str]     = None
         self.winner:    Optional[str]     = None   # "police" | "thieves"
         self.first_caught_id: Optional[str] = None  # Rule 6: first thief caught this round
+        self.scores:    Dict[str, int]    = {}      # player_id → total score
         self._timer_task: Optional[asyncio.Task]   = None
         self._tick_task:  Optional[asyncio.Task]   = None
+
+    def award_round_points(self):
+        """Award points for the just-finished round and return per-player score snapshot."""
+        if self.winner == "police":
+            # Police gets 2 pts; uncaught thieves get 0; caught thieves get 0
+            police = self.players.get(self.police_id)
+            if police:
+                self.scores[police.id] = self.scores.get(police.id, 0) + 2
+        elif self.winner == "thieves":
+            # Each alive thief gets 2 pts; the thief who caught police gets +1 bonus
+            for p in self.players.values():
+                if p.role == Role.THIEF and p.alive:
+                    self.scores[p.id] = self.scores.get(p.id, 0) + 2
+        # Everyone who participated gets 1 participation point
+        for p in self.players.values():
+            self.scores.setdefault(p.id, 0)
+        return self.score_snapshot()
+
+    def score_snapshot(self) -> list:
+        return sorted([
+            {"id": p.id, "name": p.name, "score": self.scores.get(p.id, 0)}
+            for p in self.players.values()
+        ], key=lambda x: -x["score"])
 
     # ── Player management ──────────────────────────────────────────────────
 
@@ -171,7 +217,7 @@ class Room:
 
     def start_hiding(self, next_police_id: Optional[str] = None):
         self.phase          = Phase.HIDING
-        self.time_left      = HIDE_TIME
+        self.time_left      = self.hide_time
         self.winner         = None
         self.first_caught_id = None
         self.assign_roles(next_police_id)
@@ -197,39 +243,6 @@ class Room:
         if _is_walkable(p.x, ny):
             p.y = ny
 
-    def check_captures(self) -> Optional[str]:
-        """
-        Returns winner string if game ended, else None.
-        Must be called only during ACTIVE phase.
-        """
-        police = self.players.get(self.police_id)
-        if not police or not police.alive:
-            return None
-
-        alive_thieves = [
-            p for p in self.players.values()
-            if p.role == Role.THIEF and p.alive
-        ]
-
-        for thief in alive_thieves:
-            dist = _distance(police, thief)
-            if dist < CAPTURE_RADIUS:
-                if thief.is_connected:
-                    thief.alive = False         # thief captured
-
-        # Re-check after captures
-        alive_after = [p for p in self.players.values() if p.role == Role.THIEF and p.alive]
-        if not alive_after:
-            return "police"
-
-        # Thief counter-captures police (any thief within CAPTURE_RADIUS can tag police)
-        for thief in alive_thieves:
-            if thief.alive and _distance(police, thief) < CAPTURE_RADIUS:
-                # already handled above; but if thief survived, check if police is caught
-                pass
-
-        return None
-
     def tick_captures(self) -> Optional[str]:
         """Called each game tick. Returns winner or None."""
         if self.phase != Phase.ACTIVE:
@@ -244,14 +257,16 @@ class Room:
             if p.role == Role.THIEF and p.alive
         ]
 
-        # Rule 5: Check thief-catches-police FIRST (smaller radius — must sneak close)
+        # Rule 5: Thief touches police from BEHIND → thieves win (sneak attack).
+        # Thief in FRONT of police → police can see them → fall through to police-capture.
         for thief in alive_thieves:
             if _distance(police, thief) < COUNTER_RADIUS:
-                self.winner = "thieves"
-                self.phase  = Phase.ENDED
-                return "thieves"
+                if _thief_is_behind_police(police, thief):
+                    self.winner = "thieves"
+                    self.phase  = Phase.ENDED
+                    return "thieves"
 
-        # Police catches thieves (larger radius)
+        # Police catches thieves (any direction)
         for thief in alive_thieves:
             if _distance(police, thief) < CAPTURE_RADIUS:
                 thief.alive = False
@@ -269,14 +284,21 @@ class Room:
 
     def public_state(self) -> dict:
         return {
-            "type":      "state",
-            "room_id":   self.room_id,
-            "host_id":   self.host_id,
-            "phase":     self.phase,
-            "time_left": self.time_left,
-            "police_id": self.police_id,
-            "winner":    self.winner,
-            "players":   [p.to_dict() for p in self.players.values()],
+            "type":          "state",
+            "room_id":       self.room_id,
+            "host_id":       self.host_id,
+            "phase":         self.phase,
+            "time_left":     self.time_left,
+            "police_id":     self.police_id,
+            "winner":        self.winner,
+            "players":       [p.to_dict() for p in self.players.values()],
+            "scores":        self.score_snapshot(),
+            "settings": {
+                "hide_time":     self.hide_time,
+                "round_time":    self.round_time,
+                "total_rounds":  self.total_rounds,
+                "current_round": self.current_round,
+            },
         }
 
     def cancel_tasks(self):
@@ -294,8 +316,12 @@ class PTRoomManager:
     def __init__(self):
         self._rooms: Dict[str, Room] = {}
 
-    def create(self, room_id: str, host_id: str) -> Room:
-        room = Room(room_id, host_id)
+    def create(self, room_id: str, host_id: str,
+               round_time: int = DEFAULT_ROUND_TIME,
+               hide_time: int = HIDE_TIME,
+               total_rounds: int = 1) -> Room:
+        room = Room(room_id, host_id, round_time=round_time,
+                    hide_time=hide_time, total_rounds=total_rounds)
         self._rooms[room_id] = room
         return room
 
