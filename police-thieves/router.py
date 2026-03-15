@@ -3,7 +3,7 @@ Police & Thieves – FastAPI router
 WebSocket: /police-thieves/ws/{room_id}/{player_id}
 HTTP:
   GET  /police-thieves/rooms          – list rooms
-  POST /police-thieves/rooms          – create room  ?host_name=…&round_time=…
+  POST /police-thieves/rooms          – create room  ?host_name=…&round_time=…&hide_time=…&num_thieves=…&total_rounds=…
   GET  /police-thieves/rooms/{room_id} – room info
 """
 
@@ -14,7 +14,7 @@ import uuid
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException, Query
 from typing import Dict
 
-from game import pt_rooms, Phase, HIDE_TIME, MAX_PLAYERS
+from game import pt_rooms, Phase, HIDE_TIME, MAX_PLAYERS, Room
 
 router = APIRouter(prefix="/police-thieves", tags=["police-thieves"])
 
@@ -59,60 +59,44 @@ async def _run_hide_timer(room_id: str):
         if room.phase == Phase.HIDING:
             room.start_active()
             await _broadcast_state(room_id)
-            room._timer_task = asyncio.create_task(_run_round_timer(room_id))
-            room._tick_task  = asyncio.create_task(_run_tick(room_id))
+            # round_time == 0 means no time limit — only start the capture tick, no countdown
+            if room.round_time > 0:
+                room._timer_task = asyncio.create_task(_run_round_timer(room_id))
+            room._tick_task = asyncio.create_task(_run_tick(room_id))
     except asyncio.CancelledError:
         pass
 
 
-async def _finish_round(room_id: str, winner: str, reason: str):
-    """Award points, broadcast round_over, then auto-start next round or end game."""
+async def _maybe_next_round(room_id: str):
+    """After a short delay, auto-start next round if rounds remain; else stay ENDED."""
+    await asyncio.sleep(5)
     room = pt_rooms.get(room_id)
-    if not room:
+    if not room or room.phase != Phase.ENDED:
         return
-    scores = room.award_round_points()
-    more_rounds = room.current_round < room.total_rounds
-    await _broadcast(room_id, {
-        "type":          "round_over",
-        "winner":        winner,
-        "reason":        reason,
-        "round":         room.current_round,
-        "total_rounds":  room.total_rounds,
-        "scores":        scores,
-        "more_rounds":   more_rounds,
-        "next_in":       7 if more_rounds else 0,  # seconds until next round
-    })
-    if more_rounds:
-        # Countdown to next round, then auto-start
-        for i in range(7, 0, -1):
-            await asyncio.sleep(1)
-            await _broadcast(room_id, {"type": "next_round_countdown", "seconds": i - 1})
-        room.current_round += 1
-        # Rule 6: determine next police
-        next_police_id = getattr(room, "_next_police_id", None)
-        room._next_police_id = None
+    if room.current_round < room.total_rounds:
         room.cancel_tasks()
-        room.start_hiding(next_police_id)
+        # Rule 6: determine next police
+        next_police = None
+        if room.winner == "police" and room.first_caught_id and room.first_caught_id in room.players:
+            next_police = room.first_caught_id
+        elif room.winner == "thieves" and room.police_id and room.police_id in room.players:
+            next_police = room.police_id
+        room.winner    = None
+        room.police_id = None
+        for p in room.players.values():
+            p.role  = None   # type: ignore[assignment]
+            p.alive = True
+        room.start_hiding(next_police)
         await _broadcast_state(room_id)
         room._timer_task = asyncio.create_task(_run_hide_timer(room_id))
-    else:
-        # All rounds done — final game over
-        await _broadcast(room_id, {"type": "game_over", "winner": winner, "reason": reason,
-                                   "final": True, "scores": scores})
-        await _broadcast_state(room_id)
 
 
 async def _run_round_timer(room_id: str):
-    """Count down active phase; thieves win on timeout. round_time==0 means no limit."""
+    """Count down active phase; thieves win on timeout."""
     room = pt_rooms.get(room_id)
     if not room:
         return
     try:
-        if room.round_time == 0:
-            # No time limit — just wait until the phase ends via captures
-            while room.phase == Phase.ACTIVE:
-                await asyncio.sleep(1)
-            return
         while room.time_left > 0 and room.phase == Phase.ACTIVE:
             await asyncio.sleep(1)
             room.time_left -= 1
@@ -120,7 +104,15 @@ async def _run_round_timer(room_id: str):
         if room.phase == Phase.ACTIVE:
             room.winner = "thieves"
             room.phase  = Phase.ENDED
-            asyncio.create_task(_finish_round(room_id, "thieves", "timeout"))
+            room._award_scores("thieves")
+            scores = [{"id": p.id, "name": p.name, "score": p.score, "wins": p.wins, "role": p.role} for p in room.players.values()]
+            await _broadcast(room_id, {
+                "type": "game_over", "winner": "thieves", "reason": "timeout",
+                "current_round": room.current_round, "total_rounds": room.total_rounds,
+                "scores": scores,
+            })
+            await _broadcast_state(room_id)
+            asyncio.create_task(_maybe_next_round(room_id))
     except asyncio.CancelledError:
         pass
 
@@ -136,7 +128,14 @@ async def _run_tick(room_id: str):
             winner = room.tick_captures()
             if winner:
                 reason = "all_caught" if winner == "police" else "police_caught"
-                asyncio.create_task(_finish_round(room_id, winner, reason))
+                scores = [{"id": p.id, "name": p.name, "score": p.score, "wins": p.wins, "role": p.role} for p in room.players.values()]
+                await _broadcast(room_id, {
+                    "type": "game_over", "winner": winner, "reason": reason,
+                    "current_round": room.current_round, "total_rounds": room.total_rounds,
+                    "scores": scores,
+                })
+                await _broadcast_state(room_id)
+                asyncio.create_task(_maybe_next_round(room_id))
                 break
             # Send lightweight position-only update every tick
             positions = [
@@ -164,16 +163,19 @@ def list_rooms():
 @router.post("/rooms")
 def create_room(
     host_name:    str = Query("Host"),
-    round_time:   int = Query(120, ge=0, le=600),
-    hide_time:    int = Query(30,  ge=10, le=120),
-    total_rounds: int = Query(1,   ge=1,  le=10),
+    round_time:   int = Query(120, ge=0,   le=600),  # 0 = no time limit
+    hide_time:    int = Query(30,  ge=10,  le=120),
+    num_thieves:  int = Query(5,   ge=1,   le=5),
+    total_rounds: int = Query(1,   ge=1,   le=10),
 ):
     room_id = str(uuid.uuid4())[:8].upper()
     host_id = str(uuid.uuid4())
-    room    = pt_rooms.create(room_id, host_id,
-                              round_time=round_time,
-                              hide_time=hide_time,
-                              total_rounds=total_rounds)
+    room = Room(room_id, host_id,
+                round_time=round_time,
+                hide_time=hide_time,
+                num_thieves=num_thieves,
+                total_rounds=total_rounds)
+    pt_rooms._rooms[room_id] = room
     room.add_player(host_id, host_name, ws=None)
     return {"room_id": room_id, "player_id": host_id}
 
@@ -264,8 +266,6 @@ async def ws_endpoint(ws: WebSocket, room_id: str):
                     continue
 
                 room.cancel_tasks()
-                room.current_round = 1
-                room.scores = {}
                 room.start_hiding(getattr(room, "_next_police_id", None))
                 room._next_police_id = None
                 await _broadcast_state(room_id)
